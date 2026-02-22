@@ -12,6 +12,16 @@
 - Shadow sync (non-auth data sharing):
   - `cdxh shadow <source_home> <target_alias> [flags]`
 
+## Path Resolution Design
+
+`cdxh` uses one consistent resolution model across commands (`cdxh <alias_or_path>`, `show home`, `shadow` refs):
+
+1. Alias map (`~/.config/cdxh/aliases.json`)
+2. `$HOME/<alias_or_path>`
+3. Explicit path (including `~` expansion)
+
+If none resolves to an existing directory, `cdxh` exits with an error.
+
 ## Install
 
 ```bash
@@ -66,6 +76,13 @@ Optional:
 
 - `gh` (for GitHub repo operations)
 - `jq` is **not required** by this script
+
+## Platform Support
+
+- Fully supported: macOS, Linux
+- Supported with compatible shell: WSL, Git-Bash
+- Not officially supported: native Windows PowerShell / CMD
+
 
 ## License
 
