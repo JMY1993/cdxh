@@ -66,16 +66,11 @@ Default behavior:
 
 ## Dependencies
 
-Runtime dependencies:
+Runtime requirements:
 
-- `bash`
 - `python3`
 - `codex` (only needed when running `cdxh <alias_or_path>`)
-
-Optional:
-
-- `gh` (for GitHub repo operations)
-- `jq` is **not required** by this script
+- A POSIX shell environment with Bash available (invoking from zsh is supported)
 
 ## Platform Support
 
