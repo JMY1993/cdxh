@@ -1,0 +1,704 @@
+#!/bin/bash
+
+set -euo pipefail
+
+VERSION="0.2.0"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cdxh"
+ALIASES_FILE="$CONFIG_DIR/aliases.json"
+SHADOWS_FILE="$CONFIG_DIR/shadows.json"
+
+SHARED_PATHS=(
+  "sessions"
+  "archived_sessions"
+  "history.jsonl"
+  "models_cache.json"
+  ".codex-global-state.json"
+  "skills"
+  "vendor_imports"
+  "session_index.jsonl"
+)
+
+LOCAL_DIRS=("sqlite" "tmp" "log" "shell_snapshots" "rules")
+
+die() {
+  echo "cdxh: $*" >&2
+  exit 1
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  cdxh <alias_or_path> [codex_args...]
+  cdxh show home <alias_or_path>
+  cdxh shadow <source_home> <target_alias> [--path <dir>] [--auth-from <home>] [--force] [--copy]
+  cdxh help
+  cdxh --help
+  cdxh --version
+  cdxh alias list
+  cdxh alias get <name>
+  cdxh alias add <name> <path> [--force] [--mkdir]
+  cdxh alias set <name> <path> [--mkdir]
+  cdxh alias rm <name>
+USAGE
+}
+
+alias_usage() {
+  cat <<'USAGE'
+Alias commands:
+  cdxh alias help
+  cdxh alias list
+  cdxh alias get <name>
+  cdxh alias add <name> <path> [--force] [--mkdir]
+  cdxh alias set <name> <path> [--mkdir]
+  cdxh alias rm <name>
+USAGE
+}
+
+show_usage() {
+  cat <<'USAGE'
+Show commands:
+  cdxh show home <alias_or_path>
+USAGE
+}
+
+shadow_usage() {
+  cat <<'USAGE'
+Shadow command:
+  cdxh shadow <source_home> <target_alias> [--path <dir>] [--auth-from <home>] [--force] [--copy]
+
+Defaults:
+  - preserve target auth (no auth copy unless --auth-from is provided)
+  - sync non-auth data from source via symlink (use --copy for one-time copy)
+  - write shadow metadata to ~/.config/cdxh/shadows.json
+USAGE
+}
+
+ensure_config_dir() {
+  mkdir -p "$CONFIG_DIR"
+}
+
+validate_alias_name() {
+  local name="$1"
+  [[ -n "$name" ]] || die "alias name cannot be empty"
+  [[ "$name" != -* ]] || die "alias name cannot start with '-'"
+  [[ "$name" != */* ]] || die "alias name cannot contain '/'"
+}
+
+expand_tilde() {
+  local p="$1"
+  case "$p" in
+    "~") printf '%s\n' "$HOME" ;;
+    "~/"*) printf '%s\n' "$HOME/${p#~/}" ;;
+    *) printf '%s\n' "$p" ;;
+  esac
+}
+
+normalize_existing_dir() {
+  local p="$1"
+  (cd "$p" && pwd -P)
+}
+
+json_alias_do() {
+  local op="$1"
+  shift
+  python3 - "$ALIASES_FILE" "$op" "$@" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+file_path = sys.argv[1]
+op = sys.argv[2]
+args = sys.argv[3:]
+
+def fail(msg, code=1):
+    print(f"cdxh: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+def load_map():
+    if not os.path.exists(file_path):
+        return {}
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+            if raw == "":
+                return {}
+            data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        fail(f"invalid JSON in {file_path}: {exc}", 2)
+    except OSError as exc:
+        fail(f"cannot read {file_path}: {exc}", 2)
+    if not isinstance(data, dict):
+        fail(f"invalid aliases format in {file_path}: expected JSON object", 2)
+    for k, v in data.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            fail(f"invalid aliases format in {file_path}: keys/values must be strings", 2)
+    return data
+
+def save_map(data):
+    parent = os.path.dirname(file_path)
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".aliases.", suffix=".json.tmp", dir=parent)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, file_path)
+
+data = load_map()
+
+if op == "get":
+    name = args[0]
+    if name in data:
+        print(data[name])
+        raise SystemExit(0)
+    raise SystemExit(1)
+
+if op == "list":
+    for k in sorted(data.keys()):
+        print(f"{k}\t{data[k]}")
+    raise SystemExit(0)
+
+if op == "add":
+    name, path, force = args[0], args[1], args[2] == "1"
+    if name in data and not force:
+        fail(f"alias '{name}' already exists. Use --force to overwrite.", 3)
+    data[name] = path
+    save_map(data)
+    raise SystemExit(0)
+
+if op == "set":
+    name, path = args[0], args[1]
+    data[name] = path
+    save_map(data)
+    raise SystemExit(0)
+
+if op == "rm":
+    name = args[0]
+    if name not in data:
+        fail(f"alias '{name}' does not exist", 4)
+    del data[name]
+    save_map(data)
+    raise SystemExit(0)
+
+fail(f"unsupported operation: {op}", 2)
+PY
+}
+
+json_shadow_do() {
+  local op="$1"
+  shift
+  python3 - "$SHADOWS_FILE" "$op" "$@" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+file_path = sys.argv[1]
+op = sys.argv[2]
+args = sys.argv[3:]
+
+def fail(msg, code=1):
+    print(f"cdxh: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+def load_map():
+    if not os.path.exists(file_path):
+        return {}
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+            if raw == "":
+                return {}
+            data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        fail(f"invalid JSON in {file_path}: {exc}", 2)
+    except OSError as exc:
+        fail(f"cannot read {file_path}: {exc}", 2)
+    if not isinstance(data, dict):
+        fail(f"invalid shadows format in {file_path}: expected JSON object", 2)
+    return data
+
+def save_map(data):
+    parent = os.path.dirname(file_path)
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".shadows.", suffix=".json.tmp", dir=parent)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, file_path)
+
+data = load_map()
+
+if op == "get":
+    name = args[0]
+    if name in data:
+        print(json.dumps(data[name], separators=(",", ":")))
+        raise SystemExit(0)
+    raise SystemExit(1)
+
+if op == "all":
+    print(json.dumps(data, separators=(",", ":")))
+    raise SystemExit(0)
+
+if op == "set":
+    name = args[0]
+    value = json.loads(args[1])
+    data[name] = value
+    save_map(data)
+    raise SystemExit(0)
+
+if op == "rm":
+    name = args[0]
+    if name in data:
+        del data[name]
+        save_map(data)
+    raise SystemExit(0)
+
+fail(f"unsupported operation: {op}", 2)
+PY
+}
+
+resolve_target_dir() {
+  local target="$1"
+  local mapped
+  local candidate
+  local explicit
+
+  if mapped="$(json_alias_do get "$target" 2>/dev/null)"; then
+    candidate="$(expand_tilde "$mapped")"
+    [[ -d "$candidate" ]] || die "alias '$target' points to missing directory: $candidate"
+    normalize_existing_dir "$candidate"
+    return 0
+  fi
+
+  candidate="$HOME/$target"
+  if [[ -d "$candidate" ]]; then
+    normalize_existing_dir "$candidate"
+    return 0
+  fi
+
+  explicit="$(expand_tilde "$target")"
+  if [[ -d "$explicit" ]]; then
+    normalize_existing_dir "$explicit"
+    return 0
+  fi
+
+  die "cannot resolve '$target' to a directory (tried alias map, '$HOME/$target', and '$explicit')"
+}
+
+cmd_alias_list() {
+  local out=""
+  if ! out="$(json_alias_do list)"; then
+    exit $?
+  fi
+
+  if [[ -z "$out" ]]; then
+    echo "No aliases configured."
+    return 0
+  fi
+
+  printf '%-16s %-8s %-30s %s\n' "ALIAS" "TYPE" "SOURCE" "PATH"
+  while IFS=$'\t' read -r name path; do
+    local meta=""
+    local type="normal"
+    local source="-"
+    local health=""
+    if meta="$(json_shadow_do get "$name" 2>/dev/null)"; then
+      type="shadow"
+      source="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("source_home","-"))' "$meta")"
+      health="ok"
+      if [[ ! -d "$source" ]]; then
+        health="degraded"
+      fi
+      if [[ "$health" == "ok" ]]; then
+        while IFS= read -r rel; do
+          [[ -n "$rel" ]] || continue
+          local dst="$path/$rel"
+          local src="$source/$rel"
+          local mode
+          mode="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("mode","symlink"))' "$meta")"
+          if [[ "$mode" == "symlink" && -e "$src" ]]; then
+            if [[ ! -L "$dst" ]] || [[ "$(readlink "$dst")" != "$src" ]]; then
+              health="degraded"
+              break
+            fi
+          fi
+        done < <(python3 -c 'import json,sys; [print(x) for x in json.loads(sys.argv[1]).get("managed_paths",[])]' "$meta")
+      fi
+      if [[ "$health" != "ok" ]]; then
+        type="shadow!"
+      fi
+    fi
+    printf '%-16s %-8s %-30s %s\n' "$name" "$type" "$source" "$path"
+  done <<<"$out"
+}
+
+cmd_alias_get() {
+  [[ $# -eq 1 ]] || die "usage: cdxh alias get <name>"
+  validate_alias_name "$1"
+  if ! json_alias_do get "$1"; then
+    die "alias '$1' does not exist"
+  fi
+}
+
+cmd_alias_add_or_set() {
+  local mode="$1"
+  shift
+
+  [[ $# -ge 2 ]] || die "usage: cdxh alias $mode <name> <path> [--force] [--mkdir]"
+
+  local name="$1"
+  local raw_path="$2"
+  shift 2
+
+  local force="0"
+  local do_mkdir="0"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force="1" ;;
+      --mkdir) do_mkdir="1" ;;
+      *) die "unknown option: $1" ;;
+    esac
+    shift
+  done
+
+  validate_alias_name "$name"
+
+  local path_expanded
+  path_expanded="$(expand_tilde "$raw_path")"
+
+  if [[ ! -d "$path_expanded" ]]; then
+    if [[ "$do_mkdir" == "1" ]]; then
+      mkdir -p "$path_expanded"
+    else
+      die "directory does not exist: $path_expanded (use --mkdir to create it)"
+    fi
+  fi
+
+  local path_abs
+  path_abs="$(normalize_existing_dir "$path_expanded")"
+
+  ensure_config_dir
+  if [[ "$mode" == "add" ]]; then
+    json_alias_do add "$name" "$path_abs" "$force"
+  else
+    json_alias_do set "$name" "$path_abs"
+  fi
+
+  echo "$name -> $path_abs"
+}
+
+cmd_alias_rm() {
+  [[ $# -eq 1 ]] || die "usage: cdxh alias rm <name>"
+  validate_alias_name "$1"
+  json_alias_do rm "$1"
+  json_shadow_do rm "$1" || true
+  echo "Removed alias '$1'"
+}
+
+cmd_alias() {
+  [[ $# -ge 1 ]] || { alias_usage; exit 1; }
+
+  local sub="$1"
+  shift
+  case "$sub" in
+    help|-h|--help)
+      [[ $# -eq 0 ]] || die "usage: cdxh alias help"
+      alias_usage
+      ;;
+    list)
+      [[ $# -eq 0 ]] || die "usage: cdxh alias list"
+      cmd_alias_list
+      ;;
+    get) cmd_alias_get "$@" ;;
+    add) cmd_alias_add_or_set add "$@" ;;
+    set) cmd_alias_add_or_set set "$@" ;;
+    rm) cmd_alias_rm "$@" ;;
+    *) die "unknown alias subcommand: $sub" ;;
+  esac
+}
+
+cmd_show_home() {
+  [[ $# -eq 1 ]] || die "usage: cdxh show home <alias_or_path>"
+  resolve_target_dir "$1"
+}
+
+cmd_show() {
+  [[ $# -ge 1 ]] || { show_usage; exit 1; }
+  local sub="$1"
+  shift
+  case "$sub" in
+    home) cmd_show_home "$@" ;;
+    help|-h|--help)
+      [[ $# -eq 0 ]] || die "usage: cdxh show help"
+      show_usage
+      ;;
+    *) die "unknown show subcommand: $sub" ;;
+  esac
+}
+
+copy_if_exists() {
+  local src="$1"
+  local dst="$2"
+  if [[ -f "$src" ]]; then
+    cp -f "$src" "$dst"
+  fi
+}
+
+shadow_sync_path() {
+  local mode="$1"
+  local src="$2"
+  local dst="$3"
+
+  if [[ ! -e "$src" ]]; then
+    return 0
+  fi
+
+  if [[ "$mode" == "symlink" ]]; then
+    ln -s "$src" "$dst"
+  else
+    if [[ -d "$src" ]]; then
+      cp -R "$src" "$dst"
+    else
+      cp -f "$src" "$dst"
+    fi
+  fi
+}
+
+cmd_shadow() {
+  [[ $# -ge 2 ]] || { shadow_usage; exit 1; }
+
+  local source_ref="$1"
+  local target_alias="$2"
+  shift 2
+
+  local raw_path=""
+  local auth_from_ref=""
+  local force="0"
+  local mode="symlink"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --path)
+        [[ $# -ge 2 ]] || die "missing value for --path"
+        raw_path="$2"
+        shift 2
+        ;;
+      --auth-from)
+        [[ $# -ge 2 ]] || die "missing value for --auth-from"
+        auth_from_ref="$2"
+        shift 2
+        ;;
+      --force)
+        force="1"
+        shift
+        ;;
+      --copy)
+        mode="copy"
+        shift
+        ;;
+      *)
+        die "unknown option: $1"
+        ;;
+    esac
+  done
+
+  validate_alias_name "$target_alias"
+
+  local source_home
+  source_home="$(resolve_target_dir "$source_ref")"
+
+  local target_path=""
+  local existing_alias=""
+  if existing_alias="$(json_alias_do get "$target_alias" 2>/dev/null)"; then
+    target_path="$(expand_tilde "$existing_alias")"
+    if [[ -n "$raw_path" ]]; then
+      local path_expanded
+      path_expanded="$(expand_tilde "$raw_path")"
+      mkdir -p "$path_expanded"
+      path_expanded="$(normalize_existing_dir "$path_expanded")"
+      if [[ "$path_expanded" != "$target_path" && "$force" != "1" ]]; then
+        die "alias '$target_alias' already points to $target_path (use --force to repoint)"
+      fi
+      target_path="$path_expanded"
+    fi
+  else
+    if [[ -n "$raw_path" ]]; then
+      target_path="$(expand_tilde "$raw_path")"
+    else
+      target_path="$HOME/cdx_homes/$target_alias"
+    fi
+    mkdir -p "$target_path"
+    target_path="$(normalize_existing_dir "$target_path")"
+  fi
+
+  local existing_meta=""
+  if existing_meta="$(json_shadow_do get "$target_alias" 2>/dev/null)" && [[ "$force" != "1" ]]; then
+    die "shadow metadata already exists for '$target_alias' (use --force to re-apply)"
+  fi
+
+  mkdir -p "$target_path"
+  for d in "${LOCAL_DIRS[@]}"; do
+    mkdir -p "$target_path/$d"
+  done
+
+  # Sync non-auth local files from source.
+  copy_if_exists "$source_home/config.toml" "$target_path/config.toml"
+  copy_if_exists "$source_home/version.json" "$target_path/version.json"
+
+  # Optional auth copy (default is preserve target auth).
+  local auth_mode="preserve_target"
+  local auth_from_home=""
+  if [[ -n "$auth_from_ref" ]]; then
+    auth_from_home="$(resolve_target_dir "$auth_from_ref")"
+    copy_if_exists "$auth_from_home/auth.json" "$target_path/auth.json"
+    copy_if_exists "$auth_from_home/auth.json.backup-251120" "$target_path/auth.json.backup-251120"
+    copy_if_exists "$auth_from_home/.credentials.json" "$target_path/.credentials.json"
+    auth_mode="from_home"
+  fi
+
+  for rel in "${SHARED_PATHS[@]}"; do
+    local src="$source_home/$rel"
+    local dst="$target_path/$rel"
+
+    if [[ ! -e "$src" ]]; then
+      continue
+    fi
+
+    if [[ -L "$dst" && "$mode" == "symlink" && "$(readlink "$dst")" == "$src" ]]; then
+      continue
+    fi
+
+    if [[ -e "$dst" || -L "$dst" ]]; then
+      if [[ "$force" != "1" ]]; then
+        die "target path already exists: $dst (use --force to replace managed paths)"
+      fi
+      rm -rf "$dst"
+    fi
+
+    shadow_sync_path "$mode" "$src" "$dst"
+  done
+
+  ensure_config_dir
+  if json_alias_do get "$target_alias" >/dev/null 2>&1; then
+    json_alias_do set "$target_alias" "$target_path"
+  else
+    json_alias_do add "$target_alias" "$target_path" "0"
+  fi
+
+  local now
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local meta_json
+  meta_json="$(python3 - "$source_home" "$target_path" "$mode" "$auth_mode" "$auth_from_home" "$now" "${SHARED_PATHS[@]}" <<'PY'
+import json
+import sys
+
+source_home = sys.argv[1]
+target_path = sys.argv[2]
+mode = sys.argv[3]
+auth_mode = sys.argv[4]
+auth_from = sys.argv[5]
+ts = sys.argv[6]
+managed_paths = sys.argv[7:]
+
+obj = {
+    "source_home": source_home,
+    "target_path": target_path,
+    "mode": mode,
+    "auth_mode": auth_mode,
+    "auth_from": auth_from if auth_from else None,
+    "managed_paths": managed_paths,
+    "updated_at": ts,
+}
+print(json.dumps(obj, separators=(",", ":")))
+PY
+)"
+
+  if existing_meta="$(json_shadow_do get "$target_alias" 2>/dev/null)"; then
+    meta_json="$(python3 - "$existing_meta" "$meta_json" <<'PY'
+import json
+import sys
+old = json.loads(sys.argv[1])
+new = json.loads(sys.argv[2])
+if "created_at" in old:
+    new["created_at"] = old["created_at"]
+else:
+    new["created_at"] = new["updated_at"]
+print(json.dumps(new, separators=(",", ":")))
+PY
+)"
+  else
+    meta_json="$(python3 - "$meta_json" <<'PY'
+import json
+import sys
+obj = json.loads(sys.argv[1])
+obj["created_at"] = obj["updated_at"]
+print(json.dumps(obj, separators=(",", ":")))
+PY
+)"
+  fi
+
+  json_shadow_do set "$target_alias" "$meta_json"
+
+  echo "shadow synced:"
+  echo "  source      $source_home"
+  echo "  target      $target_alias -> $target_path"
+  echo "  mode        $mode"
+  echo "  auth-mode   $auth_mode"
+  if [[ -n "$auth_from_home" ]]; then
+    echo "  auth-from   $auth_from_home"
+  fi
+}
+
+main() {
+  [[ $# -ge 1 ]] || { usage; exit 1; }
+
+  case "$1" in
+    help|-h|--help)
+      [[ $# -eq 1 ]] || die "usage: cdxh --help"
+      usage
+      exit 0
+      ;;
+    version|-v|--version)
+      [[ $# -eq 1 ]] || die "usage: cdxh --version"
+      echo "cdxh $VERSION"
+      exit 0
+      ;;
+  esac
+
+  require_cmd python3
+
+  if [[ "$1" == "alias" ]]; then
+    shift
+    cmd_alias "$@"
+    exit 0
+  fi
+
+  if [[ "$1" == "show" ]]; then
+    shift
+    cmd_show "$@"
+    exit 0
+  fi
+
+  if [[ "$1" == "shadow" ]]; then
+    shift
+    cmd_shadow "$@"
+    exit 0
+  fi
+
+  local target="$1"
+  shift
+
+  require_cmd codex
+
+  local resolved
+  resolved="$(resolve_target_dir "$target")"
+  exec env CODEX_HOME="$resolved" codex "$@"
+}
+
+main "$@"
